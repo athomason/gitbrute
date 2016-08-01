@@ -33,26 +33,41 @@ import (
 )
 
 var (
-	prefix = flag.String("prefix", "bf", "Desired prefix")
-	force  = flag.Bool("force", false, "Re-run, even if current hash matches prefix")
-	cpu    = flag.Int("cpus", runtime.NumCPU(), "Number of CPUs to use. Defaults to number of processors.")
+	prefix  = flag.String("prefix", "bf", "Desired prefix")
+	regex   = flag.String("regex", "", "Regular expression to match, if provided; supercedes prefix")
+	force   = flag.Bool("force", false, "Re-run, even if current hash matches")
+	pretend = flag.Bool("pretend", false, "Don't amend, just output winning hash")
+	cpu     = flag.Int("cpus", runtime.NumCPU(), "Number of CPUs to use. Defaults to number of processors.")
 )
 
 var (
 	start     = time.Now()
 	startUnix = start.Unix()
+	rx        *regexp.Regexp
 )
 
 func main() {
 	flag.Parse()
 	runtime.GOMAXPROCS(*cpu)
-	if _, err := strconv.ParseInt(*prefix, 16, 64); err != nil {
-		log.Fatalf("Prefix %q isn't hex.", *prefix)
+	if *regex == "" {
+		if _, err := strconv.ParseInt(*prefix, 16, 64); err != nil {
+			log.Fatalf("Prefix %q isn't hex.", *prefix)
+		}
+	} else {
+		rx = regexp.MustCompile(*regex)
 	}
 
 	hash := curHash()
-	if strings.HasPrefix(hash, *prefix) && !*force {
-		return
+	if !*force {
+		if rx == nil {
+			if strings.HasPrefix(hash, *prefix) {
+				return
+			}
+		} else {
+			if rx.MatchString(hash) {
+				return
+			}
+		}
 	}
 
 	obj, err := exec.Command("git", "cat-file", "-p", hash).Output()
@@ -77,6 +92,10 @@ func main() {
 
 	w := <-winner
 	close(done)
+
+	if *pretend {
+		return
+	}
 
 	cmd := exec.Command("git", "commit", "--amend", "--date="+w.author.String(), "--file=-")
 	cmd.Env = append([]string{"GIT_COMMITTER_DATE=" + w.committer.String()}, os.Environ()...)
@@ -118,8 +137,19 @@ func bruteForce(obj []byte, winner chan<- solution, possibilities <-chan try, do
 			strconv.AppendInt(blob[:cdatei], cd.n, 10)
 			s1.Reset()
 			s1.Write(blob)
-			if !bytes.HasPrefix(hexInPlace(s1.Sum(hexBuf[:0])), wantHexPrefix) {
-				continue
+			h := hexInPlace(s1.Sum(hexBuf[:0]))
+			if rx == nil {
+				if !bytes.HasPrefix(h, wantHexPrefix) {
+					continue
+				}
+			} else {
+				if !rx.Match(h) {
+					continue
+				}
+			}
+
+			if *pretend {
+				fmt.Printf("%s (%s, %s)\n", h, ad, cd)
 			}
 
 			winner <- solution{ad, cd}
