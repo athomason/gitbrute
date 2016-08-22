@@ -34,6 +34,7 @@ import (
 )
 
 var (
+	mode    = flag.String("mode", "prefix", "Match determination method: prefix, regex, bingo, numeric")
 	prefix  = flag.String("prefix", "bf", "Desired prefix")
 	regex   = flag.String("regex", "", "Regular expression to match, if provided; supercedes prefix")
 	force   = flag.Bool("force", false, "Re-run, even if current hash matches")
@@ -51,22 +52,36 @@ var (
 func main() {
 	flag.Parse()
 	runtime.GOMAXPROCS(*cpu)
-	if *regex == "" {
+
+	switch *mode {
+	case "prefix":
 		if _, err := strconv.ParseInt(*prefix, 16, 64); err != nil {
 			log.Fatalf("Prefix %q isn't hex.", *prefix)
 		}
-	} else {
+	case "regex":
 		rx = regexp.MustCompile(*regex)
+	case "bingo", "numeric":
+	default:
+		log.Fatalf("Unknown mode %s", *mode)
 	}
 
 	hash := curHash()
 	if !*force {
-		if rx == nil {
+		switch *mode {
+		case "prefix":
 			if strings.HasPrefix(hash, *prefix) {
 				return
 			}
-		} else {
+		case "regex":
 			if rx.MatchString(hash) {
+				return
+			}
+		case "bingo":
+			if isBingo([]byte(hash)) {
+				return
+			}
+		case "numeric":
+			if isNumeric([]byte(hash)) {
 				return
 			}
 		}
@@ -136,6 +151,20 @@ func bruteForce(obj []byte, winner chan<- solution, period, offset int, done <-c
 	wantHexPrefix := []byte(*prefix)
 	hexBuf := make([]byte, 0, sha1.Size*2)
 
+	var match func([]byte) bool
+	switch *mode {
+	case "prefix":
+		match = func(h []byte) bool {
+			return bytes.HasPrefix(h, wantHexPrefix)
+		}
+	case "regex":
+		match = rx.Match
+	case "bingo":
+		match = isBingo
+	case "numeric":
+		match = isNumeric
+	}
+
 	for {
 		select {
 		case <-done:
@@ -149,14 +178,8 @@ func bruteForce(obj []byte, winner chan<- solution, period, offset int, done <-c
 			s1.Reset()
 			s1.Write(blob)
 			h := hexInPlace(s1.Sum(hexBuf[:0]))
-			if rx == nil {
-				if !bytes.HasPrefix(h, wantHexPrefix) {
-					continue
-				}
-			} else {
-				if !rx.Match(h) {
-					continue
-				}
+			if !match(h) {
+				continue
 			}
 
 			if *pretend {
@@ -278,4 +301,24 @@ func hexInPlace(v []byte) []byte {
 		h[i*2+1] = hex[b&0xf]
 	}
 	return h
+}
+
+// isBingo is a fast path for /^[a-f]{7}/
+func isBingo(h []byte) bool {
+	for _, b := range h[:7] {
+		if b < 'a' || b > 'f' {
+			return false
+		}
+	}
+	return true
+}
+
+// isNumeric is a fast path for /^[0-9]{40}$/
+func isNumeric(h []byte) bool {
+	for _, b := range h {
+		if b < '0' || b > '9' {
+			return false
+		}
+	}
+	return true
 }
