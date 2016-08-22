@@ -27,6 +27,7 @@ import (
 	"os/exec"
 	"regexp"
 	"runtime"
+	"runtime/pprof"
 	"strconv"
 	"strings"
 	"time"
@@ -38,6 +39,7 @@ var (
 	force   = flag.Bool("force", false, "Re-run, even if current hash matches")
 	pretend = flag.Bool("pretend", false, "Don't amend, just output winning hash")
 	cpu     = flag.Int("cpus", runtime.NumCPU(), "Number of CPUs to use. Defaults to number of processors.")
+	profile = flag.String("profile", "", "pprof file")
 )
 
 var (
@@ -80,14 +82,20 @@ func main() {
 	}
 	msg := obj[i+2:]
 
-	possibilities := make(chan try, 512)
-	go explore(possibilities)
+	if *profile != "" {
+		fh, err := os.Create(*profile)
+		if err != nil {
+			log.Fatal(err)
+		}
+		pprof.StartCPUProfile(fh)
+		defer pprof.StopCPUProfile()
+	}
 
 	winner := make(chan solution)
 	done := make(chan struct{})
 
 	for i := 0; i < *cpu; i++ {
-		go bruteForce(obj, winner, possibilities, done)
+		go bruteForce(obj, winner, *cpu, i, done)
 	}
 
 	w := <-winner
@@ -115,7 +123,9 @@ var (
 	commiterDateRx = regexp.MustCompile(`(?m)^committer.+> (.+)`)
 )
 
-func bruteForce(obj []byte, winner chan<- solution, possibilities <-chan try, done <-chan struct{}) {
+func bruteForce(obj []byte, winner chan<- solution, period, offset int, done <-chan struct{}) {
+	e := newExplorer(period, offset)
+
 	// blob is the blob to mutate in-place repatedly while testing
 	// whether we have a match.
 	blob := []byte(fmt.Sprintf("commit %d\x00%s", len(obj), obj))
@@ -126,11 +136,12 @@ func bruteForce(obj []byte, winner chan<- solution, possibilities <-chan try, do
 	wantHexPrefix := []byte(*prefix)
 	hexBuf := make([]byte, 0, sha1.Size*2)
 
-	for t := range possibilities {
+	for {
 		select {
 		case <-done:
 			return
 		default:
+			t := e.next()
 			ad := date{startUnix - int64(t.authorBehind), authorDate.tz}
 			cd := date{startUnix - int64(t.commitBehind), commitDate.tz}
 			strconv.AppendInt(blob[:adatei], ad.n, 10)
@@ -165,29 +176,55 @@ type try struct {
 	authorBehind int
 }
 
-// explore yields the sequence:
-//     (0, 0)
+type explorer struct {
+	period, m, n int
+}
+
+// explorer.next() yields the sequence:
+//	   (0, 0)
 //
-//     (0, 1)
-//     (1, 0)
-//     (1, 1)
+//	   (0, 1)
+//	   (1, 0)
 //
-//     (0, 2)
-//     (1, 2)
-//     (2, 0)
-//     (2, 1)
-//     (2, 2)
+//	   (0, 2)
+//	   (1, 1)
+//	   (2, 0)
+//
+//	   (0, 3)
+//	   (1, 2)
+//	   (2, 1)
+//	   (3, 0)
+//
+//	   (0, 4)
+//	   (1, 3)
+//	   (2, 2)
+//	   (3, 1)
+//	   (4, 0)
 //
 //     ...
-func explore(c chan<- try) {
-	for max := 0; ; max++ {
-		for i := 0; i <= max-1; i++ {
-			c <- try{i, max}
-		}
-		for j := 0; j <= max; j++ {
-			c <- try{max, j}
+//
+// except only every period'th element is emitted, starting from the
+// offset'dth.
+func newExplorer(period, offset int) *explorer {
+	e := explorer{period: period}
+	e.advance(offset)
+	return &e
+}
+
+func (e *explorer) advance(by int) {
+	for i := 0; i < by; i++ {
+		e.n++
+		if e.n > e.m {
+			e.n = 0
+			e.m++
 		}
 	}
+}
+
+func (e *explorer) next() try {
+	t := try{e.n, e.m - e.n}
+	e.advance(e.period)
+	return t
 }
 
 // date is a git date.
