@@ -20,6 +20,7 @@ package main
 import (
 	"bytes"
 	"crypto/sha1"
+	"encoding/hex"
 	"flag"
 	"fmt"
 	"log"
@@ -66,6 +67,7 @@ func main() {
 	}
 
 	hash := curHash()
+	rawHash, _ := hex.DecodeString(hash)
 	if !*force {
 		switch *mode {
 		case "prefix":
@@ -77,11 +79,11 @@ func main() {
 				return
 			}
 		case "bingo":
-			if isBingo([]byte(hash)) {
+			if isBingo(rawHash) {
 				return
 			}
 		case "numeric":
-			if isNumeric([]byte(hash)) {
+			if isNumeric(rawHash) {
 				return
 			}
 		}
@@ -155,16 +157,17 @@ func bruteForce(obj []byte, winner chan<- solution, period, offset int, done <-c
 	switch *mode {
 	case "prefix":
 		match = func(h []byte) bool {
-			return bytes.HasPrefix(h, wantHexPrefix)
+			return bytes.HasPrefix(hexInPlace(h), wantHexPrefix)
 		}
 	case "regex":
-		match = rx.Match
+		match = func(h []byte) bool {
+			return rx.Match(hexInPlace(h))
+		}
 	case "bingo":
 		match = isBingo
 	case "numeric":
 		match = isNumeric
 	}
-
 	for {
 		select {
 		case <-done:
@@ -177,13 +180,13 @@ func bruteForce(obj []byte, winner chan<- solution, period, offset int, done <-c
 			strconv.AppendInt(blob[:cdatei], cd.n, 10)
 			s1.Reset()
 			s1.Write(blob)
-			h := hexInPlace(s1.Sum(hexBuf[:0]))
+			h := s1.Sum(hexBuf[:0])
 			if !match(h) {
 				continue
 			}
 
 			if *pretend {
-				fmt.Printf("%s (%s, %s)\n", h, ad, cd)
+				fmt.Printf("%s (%s, %s)\n", hexInPlace(h), ad, cd)
 			}
 
 			winner <- solution{ad, cd}
@@ -305,10 +308,13 @@ func hexInPlace(v []byte) []byte {
 
 // isBingo is a fast path for /^[a-f]{7}/
 func isBingo(h []byte) bool {
-	for _, b := range h[:7] {
-		if b < 'a' || b > 'f' {
+	for _, b := range h[:3] {
+		if b>>4 < 0xa || b&0xf < 0xa {
 			return false
 		}
+	}
+	if h[3]>>4 < 0xa {
+		return false
 	}
 	return true
 }
@@ -316,7 +322,7 @@ func isBingo(h []byte) bool {
 // isNumeric is a fast path for /^[0-9]{40}$/
 func isNumeric(h []byte) bool {
 	for _, b := range h {
-		if b < '0' || b > '9' {
+		if b>>4 >= 0xa || b&0xf >= 0xa {
 			return false
 		}
 	}
