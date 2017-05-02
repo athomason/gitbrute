@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-// The gitbrute command brute-forces a git commit hash prefix.
+// The gitbrute command brute-forces a git commit hash of specific forms.
 package main
 
 import (
@@ -31,12 +31,13 @@ import (
 	"runtime/pprof"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
 var (
-	mode    = flag.String("mode", "prefix", "Match determination method: prefix, regex, bingo, numeric")
-	prefix  = flag.String("prefix", "bf", "Desired prefix")
+	mode    = flag.String("mode", "prefix", "Match determination method: prefix, suffix, regex, bingo, numeric, ascending")
+	prefix  = flag.String("prefix", "abcdef", "Desired prefix or suffix")
 	regex   = flag.String("regex", "", "Regular expression to match, if provided; supercedes prefix")
 	force   = flag.Bool("force", false, "Re-run, even if current hash matches")
 	pretend = flag.Bool("pretend", false, "Don't amend, just output winning hash")
@@ -55,13 +56,13 @@ func main() {
 	runtime.GOMAXPROCS(*cpu)
 
 	switch *mode {
-	case "prefix":
+	case "prefix", "suffix":
 		if _, err := strconv.ParseInt(*prefix, 16, 64); err != nil {
 			log.Fatalf("Prefix %q isn't hex.", *prefix)
 		}
 	case "regex":
 		rx = regexp.MustCompile(*regex)
-	case "bingo", "numeric":
+	case "bingo", "numeric", "ascending":
 	default:
 		log.Fatalf("Unknown mode %s", *mode)
 	}
@@ -74,6 +75,10 @@ func main() {
 			if strings.HasPrefix(hash, *prefix) {
 				return
 			}
+		case "suffix":
+			if strings.HasSuffix(hash, *prefix) {
+				return
+			}
 		case "regex":
 			if rx.MatchString(hash) {
 				return
@@ -84,6 +89,10 @@ func main() {
 			}
 		case "numeric":
 			if isNumeric(rawHash) {
+				return
+			}
+		case "ascending":
+			if isAscending(rawHash) {
 				return
 			}
 		}
@@ -109,14 +118,14 @@ func main() {
 	}
 
 	winner := make(chan solution)
-	done := make(chan struct{})
+	var done uint32
 
 	for i := 0; i < *cpu; i++ {
-		go bruteForce(obj, winner, *cpu, i, done)
+		go bruteForce(obj, winner, *cpu, i, &done)
 	}
 
 	w := <-winner
-	close(done)
+	atomic.StoreUint32(&done, 1)
 
 	if *pretend {
 		return
@@ -140,7 +149,7 @@ var (
 	commiterDateRx = regexp.MustCompile(`(?m)^committer.+> (.+)`)
 )
 
-func bruteForce(obj []byte, winner chan<- solution, period, offset int, done <-chan struct{}) {
+func bruteForce(obj []byte, winner chan<- solution, period, offset int, done *uint32) {
 	e := newExplorer(period, offset)
 
 	// blob is the blob to mutate in-place repatedly while testing
@@ -150,14 +159,18 @@ func bruteForce(obj []byte, winner chan<- solution, period, offset int, done <-c
 	commitDate, cdatei := getDate(blob, commiterDateRx)
 
 	s1 := sha1.New()
-	wantHexPrefix := []byte(*prefix)
+	wantHexExact := []byte(*prefix)
 	hexBuf := make([]byte, 0, sha1.Size*2)
 
 	var match func([]byte) bool
 	switch *mode {
 	case "prefix":
 		match = func(h []byte) bool {
-			return bytes.HasPrefix(hexInPlace(h), wantHexPrefix)
+			return bytes.HasPrefix(hexInPlace(h), wantHexExact)
+		}
+	case "suffix":
+		match = func(h []byte) bool {
+			return bytes.HasSuffix(hexInPlace(h), wantHexExact)
 		}
 	case "regex":
 		match = func(h []byte) bool {
@@ -167,31 +180,28 @@ func bruteForce(obj []byte, winner chan<- solution, period, offset int, done <-c
 		match = isBingo
 	case "numeric":
 		match = isNumeric
+	case "ascending":
+		match = isAscending
 	}
-	for {
-		select {
-		case <-done:
-			return
-		default:
-			t := e.next()
-			ad := date{startUnix - int64(t.authorBehind), authorDate.tz}
-			cd := date{startUnix - int64(t.commitBehind), commitDate.tz}
-			strconv.AppendInt(blob[:adatei], ad.n, 10)
-			strconv.AppendInt(blob[:cdatei], cd.n, 10)
-			s1.Reset()
-			s1.Write(blob)
-			h := s1.Sum(hexBuf[:0])
-			if !match(h) {
-				continue
-			}
-
-			if *pretend {
-				fmt.Printf("%s (%s, %s)\n", hexInPlace(h), ad, cd)
-			}
-
-			winner <- solution{ad, cd}
-			return
+	for atomic.LoadUint32(done) == 0 {
+		t := e.next()
+		ad := date{startUnix - int64(t.authorBehind), authorDate.tz}
+		cd := date{startUnix - int64(t.commitBehind), commitDate.tz}
+		strconv.AppendInt(blob[:adatei], ad.n, 10)
+		strconv.AppendInt(blob[:cdatei], cd.n, 10)
+		s1.Reset()
+		s1.Write(blob)
+		h := s1.Sum(hexBuf[:0])
+		if !match(h) {
+			continue
 		}
+
+		if *pretend {
+			fmt.Printf("%s (%s, %s)\n", hexInPlace(h), ad, cd)
+		}
+
+		winner <- solution{ad, cd}
+		return
 	}
 }
 
@@ -326,5 +336,31 @@ func isNumeric(h []byte) bool {
 			return false
 		}
 	}
+	return true
+}
+
+// isAscending returns true if the leading hex digits are non-decreasing
+func isAscending(h []byte) bool {
+	const nibs = 12
+	const hn = nibs / 2
+
+	var hlast byte
+	for i, b := range h[:hn] {
+		h1 := b >> 4
+		if i > 0 && hlast > h1 {
+			return false
+		}
+		h2 := b & 0xf
+		if h1 > h2 {
+			return false
+		}
+		hlast = h2
+	}
+	if nibs%2 != 0 {
+		if hlast > h[hn]>>4 {
+			return false
+		}
+	}
+
 	return true
 }
